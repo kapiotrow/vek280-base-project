@@ -1,0 +1,70 @@
+#!/bin/bash
+# ===========================================================================
+# setup_env.sh -- per-machine tool and platform paths.
+#
+# COPY THIS FILE to setup_env.sh and edit the five paths below. setup_env.sh is
+# gitignored on purpose: it is the one file in this project that is allowed to
+# contain absolute paths, so that nothing else has to.
+#
+#   source setup_env.sh
+#
+# `make check_env` validates everything this script sets and names whatever is
+# missing. Run it first, every time, before blaming the design.
+# ===========================================================================
+
+# --- EDIT THESE FIVE -------------------------------------------------------
+
+# Vitis install. Must be the version this project was built against (2025.2);
+# the AIE compiler, HLS headers and the aietools libraries all come from here.
+export XILINX_VITIS=$HOME/Xilinx/2025.2/Vitis
+
+# Where the VEK280 base platform (.xpfm) lives.
+export PLATFORM_REPO_PATHS=$XILINX_VITIS/base_platforms
+
+# The extracted xilinx-versal-common image: supplies the Linux kernel Image and
+# the pristine rootfs.ext4 that `make rootfs` copies.
+export COMMON_IMAGE_VERSAL=$HOME/xilinx-versal-common-v2025.2
+
+# PetaLinux environment-setup script for the aarch64 sysroot. Sets CXX and
+# SDKTARGETSYSROOT, which is where the board's XRT headers and libraries are.
+export PETALINUX_ENV=/opt/petalinux/2025.2/environment-setup-cortexa72-cortexa53-amd-linux
+
+# Vitis Libraries ROOT (the directory containing dsp/, not dsp itself). Only
+# needed from phase 3 onward, when the DSPLib FFT enters the graph -- but set it
+# now so check_env has nothing left to complain about later.
+export DSPLIB_VITIS=$HOME/Vitis_Libraries
+
+# --- NOTHING BELOW HERE SHOULD NEED EDITING --------------------------------
+
+tgt_plat=xilinx_vek280_base_202520_1
+export PLATFORM=$PLATFORM_REPO_PATHS/$tgt_plat/$tgt_plat.xpfm
+
+# PetaLinux's environment script has a safety guard that exits early if
+# LD_LIBRARY_PATH is set, and it exits QUIETLY -- you get a shell with no CXX
+# and no SDKTARGETSYSROOT, and the first symptom is a host link failure about
+# missing xrt headers twenty minutes later. Unset it first.
+unset LD_LIBRARY_PATH
+if [ ! -f "$PETALINUX_ENV" ]; then
+    echo "ERROR: PETALINUX_ENV does not exist: $PETALINUX_ENV"
+    return 1
+fi
+source "$PETALINUX_ENV"
+if [ -z "$SDKTARGETSYSROOT" ]; then
+    echo "ERROR: sourcing PETALINUX_ENV did not set SDKTARGETSYSROOT."
+    echo "       Was LD_LIBRARY_PATH set? The guard exits silently."
+    return 1
+fi
+
+# Vitis settings must come AFTER PetaLinux: both prepend to PATH and the Vitis
+# tools need to win.
+source "$XILINX_VITIS/settings64.sh"
+
+echo "=== VEK280 base project environment ==="
+echo "  PLATFORM          : $PLATFORM"
+echo "  XILINX_VITIS      : $XILINX_VITIS"
+echo "  SDKTARGETSYSROOT  : $SDKTARGETSYSROOT"
+echo "  CXX               : $CXX"
+echo "  aiecompiler       : $(command -v aiecompiler || echo NOT FOUND)"
+echo "  v++               : $(command -v v++ || echo NOT FOUND)"
+echo ""
+echo "Now run:  make check_env"

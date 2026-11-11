@@ -1,0 +1,30 @@
+# Build outputs -- everything under build/ is regenerable from the sources.
+build/
+Work/
+_x/
+.Xil/
+analyzer_input/
+
+# Tool droppings. v++ and aiecompiler litter the invocation directory; the
+# reference project accumulated ~200 stray v++_*.backup.log files at its root,
+# which is the first impression this project exists to avoid.
+*.log
+*.jou
+*.str
+*.backup.log
+v++.package_summary
+xcd.log
+AIECompiler.log
+*.xclbin
+*.xsa
+*.xo
+*.vcd
+
+# The local environment. setup_env.sh carries absolute paths that are specific
+# to one machine; setup_env.sh.example is the committed template.
+setup_env.sh
+
+# Editors / IDE
+_ide/
+.vscode/
+*.swp

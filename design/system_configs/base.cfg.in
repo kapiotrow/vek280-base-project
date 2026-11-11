@@ -1,0 +1,42 @@
+# base.cfg.in -- v++ linker configuration TEMPLATE for the phase-0 design.
+#
+# THIS IS A TEMPLATE, NOT THE CONFIG. The Makefile generates
+# build/<target>/base.cfg from it, substituting @PROJECT_ROOT@.
+#
+# Why: v++ requires an ABSOLUTE path for userPostSysLinkOverlayTcl. Writing one
+# into a committed file is how a project stops building on anyone else's
+# machine -- the reference project has /home/<someone>/... baked into its linker
+# config to this day. Generating the file keeps the repo portable.
+#
+# Phase-0 topology:
+#
+#   data_src_0 --AXI4-Stream--> data_sink_0
+#
+# No AIE graph, no PLIO. Phase 2 redirects the stream into ai_engine_0.
+
+[connectivity]
+nk=data_src:1:data_src_0
+nk=data_sink:1:data_sink_0
+
+# Kernel-to-kernel AXI4-Stream. The port names are the HLS argument names.
+stream_connect=data_src_0.out:data_sink_0.in
+
+# Memory banks.
+#
+# THE VEK280 HAS LPDDR4, NOT DDR. Its memory sptags are LPDDR1 and LPDDR2; an
+# sp= line naming DDR fails to link on this platform, and copying a config from
+# a VCK190 example is the usual way to meet that error.
+#
+# The left-hand side references the m_axi ARGUMENT name (in, out) -- not the
+# HLS bundle name (gmem). Naming the bundle is accepted in some tool versions
+# and ignored in others.
+sp=data_src_0.in:LPDDR1
+sp=data_sink_0.out:LPDDR1
+
+[advanced]
+param=hw_emu.enableProfiling=false
+
+# Raises the AIE array clock to 1 GHz. Harmless in phase 0 (there is no graph
+# yet) and kept here from the start so the phase-2 diff is about the stream and
+# nothing else.
+param=compiler.userPostSysLinkOverlayTcl=@PROJECT_ROOT@/design/directives/post_sys_link.tcl
