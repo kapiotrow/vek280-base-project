@@ -1,6 +1,7 @@
 # The development cycle
 
-**Status:** current 2026-11-11 — rungs 1, 2, 3, 4 and 5 all exist (phase 1).
+**Status:** current 2026-11-11 — phase 2. All rungs exist, and phase 2 adds the
+one thing the ladder cannot give you: a demonstration of where it *fails*.
 The HLS half of rung 4 arrives with phase 4; the numbering is fixed so this page
 stays valid.
 
@@ -23,6 +24,7 @@ whether you asked a question at the cheapest rung that could answer it.
 | 4 | `make aiesim` | ~2 min | what does it cost **with the DMAs in the picture**? |
 | 4 | HLS report | min | II, latency, PL resources *(phase 4)* |
 | 5 | `make run_emu` | ~4 min | does the whole system, with real interfaces, work? |
+| 5 | `make probe_emu` | ~min | **if it hangs: which side of the stream is at fault?** |
 | 6 | board | — | how fast is it really? what does it draw? |
 
 ## What each rung cannot see
@@ -85,6 +87,143 @@ measurement. Do not quote one as the other.
 for the first time here include the ~503 ms-per-launch cost of the KDS
 completion path on this platform, which no emulation shows you.
 
+## The hole in the ladder
+
+Everything above is about choosing the cheapest rung that can answer a question.
+Phase 2 adds the other half of the skill: knowing which questions **no cheap
+rung can answer at all**.
+
+Two mutants in this project are **integration** defects, and neither is visible
+below rung 5. Measured, 2026-11-11:
+
+| | `make x86sim GRAPH=echo` | `make aiesim` | `make run_emu` |
+|---|---|---|---|
+| `MUTANT=argidx` | **PASS** | **PASS** | aborts: `bad command state, can't launch` |
+| `MUTANT=nograph` | **PASS** | **PASS** | **hangs — no error, no output** |
+
+Both cheap rungs say the design is fine. Neither of them contains a host or a
+PL, and `aiesim` feeds the PLIO from `stream_in.txt` — a producer that is
+perfectly behaved by construction. What is broken is not in the graph, not in
+the kernel and not in the PL kernels; it is in **how the three are joined**, and
+the first rung with all three in it is rung 5.
+
+### `argidx` — one line in the host
+
+```c
+r_src(in_bo, (uint32_t)n);              // positional -- WRONG
+r_src.set_arg(arg::SRC_IN, in_bo);      // explicit index -- right
+r_src.set_arg(arg::SRC_N,  (uint32_t)n);
+```
+
+An AXI4-Stream port occupies an argument slot even though it is not a settable
+register, so `n` lands on the stream port instead of on `n`.
+
+On XRT 2025.2 this **aborts at launch** with `bad command state, can't launch`,
+which is the good outcome — immediate and attributable. **Do not count on it.**
+The same mistake on the reference project produced a silent zero-trip loop
+instead: `n` stayed at zero, `ap_done` asserted a few cycles after `ap_start`,
+TVALID never rose, and the design just hung. That cost about a week, during
+which the fault was believed to be in the PLIO width, the shim placement, the
+port allocation and eventually the viability of PLIO itself — because *"no data
+arrives"* is what every one of those also looks like.
+
+Which of the two you get depends on where the stray value lands and how
+malformed the resulting command packet is. The rule is the same either way:
+**always `set_arg()` by explicit index on a kernel with a stream port.**
+
+### `nograph` — the clean deadlock
+
+The host never calls `gr.run()`. We package with `--package.defer_aie_run`, so
+loading the xclbin does not enable the AI Engine cores, and a graph whose cores
+are not running never drains its input PLIO. `data_src` fills the stream FIFO and
+stalls.
+
+This was a real bug while phase 2 was being written. With PLIO no data passes
+through the host at all, so it is easy to conclude that a PLIO design needs no
+AIE-aware host code — and it needs exactly one thing: **somebody has to switch
+the cores on.**
+
+It produces the pure symptom: the host prints `waiting for data_src` and never
+returns, with no error of any kind.
+
+### The lesson
+
+Not "distrust the cheap rungs" — they are still where arithmetic belongs.
+**Integration is its own category of defect**, it is only visible at rung 5, and
+rung 5 is therefore not optional however clean rungs 1–4 are.
+
+## When it hangs: the two tools
+
+A hung PLIO design gives you nothing — no error, no timeout, no output. Two
+tools turn that into a decision.
+
+### The handshake probe
+
+```bash
+make debug_sim                               # once per package
+make probe_emu LAUNCH_HW_EMU_EXEC=1
+```
+
+Captures TVALID, TREADY, the kernel's `ap_*` state and its `ap_*_blocking_n`
+stall reasons to a VCD, then prints a verdict.
+
+**Read this limitation before relying on it.** `xsim` buffers the VCD and
+flushes it fully only on `close_vcd`, which runs on a *clean* exit. A deadlocked
+emulation is killed instead, so what survives is the flushed **prefix** — and in
+a full-system emulation the prefix is Linux booting. Measured here on a real
+deadlock with a 420 s budget: the capture covered **91.79 µs of simulated
+time**, four orders of magnitude short of the application.
+
+So the probe needs a wall budget large enough for the traced emulation to *reach
+the application*, and tracing makes it substantially slower than an untraced
+run. `analyze_plio_vcd.py` detects a boot-only capture by its simulated-time
+window and reports `INSUFFICIENT CAPTURE — NO VERDICT` rather than a conclusion.
+(Without that check it confidently reported "the producer never produced" about
+a window in which nothing had started. `ap_start` is no help as a discriminator:
+it glitches high during reset.)
+
+When the capture *does* cover the application, three outcomes:
+
+| observation | meaning |
+|---|---|
+| **TVALID never rose** | the producer never produced. The fault is upstream of the stream. If `ap_done` asserted with zero beats, the kernel ran a zero-trip loop — its trip count was never written |
+| **TVALID=1, TREADY=0** | the consumer never accepted. Either it was never started (`MUTANT=nograph`), or the PLIO name contract is broken, or the width is wrong, or it is blocked elsewhere — in that order of likelihood |
+| **both toggled, beats < N** | a mid-stream stall. The link works; something later stopped it |
+
+`debug_sim` must be re-run after every `make package` — packaging regenerates
+`elaborate.sh` and drops the patch. Three separate things each silently defeat
+waveform capture; see [06-traps.md](06-traps.md).
+
+Two more things worth knowing about the probe:
+
+- **It discovers its own signal names.** HLS decorates them — an AXIS argument
+  called `out` becomes `out_r` — so the script sweeps by wildcard rather than
+  naming paths. Hardcoding them found nothing on the first run, and a probe that
+  resolves nothing looks exactly like a link that moved no data.
+- **`log_wave` is armed alongside `log_vcd`**, and the `.wdb` wave database is
+  written continuously. For a killed run it covers more than the VCD does, at
+  the cost of needing the Vivado viewer to read it.
+
+Given all of that, **the bisect build below is often the faster route** on a
+deadlock, and it needs no waveform at all.
+
+### The bisect build
+
+```bash
+make aiesim ECHO_SRC=synth      # or rebuild the system with it
+```
+
+The kernel synthesizes its output and never reads its input. This separates two
+faults that are indistinguishable from outside:
+
+- **output appears** → the core runs; the fault is upstream of it
+- **still nothing** → the core is not running; the input is a red herring
+
+On a design that completes, the probe is the better tool — one run, a direct
+answer. On a design that **hangs**, start with the bisect: it is far cheaper than
+getting a traced emulation to reach the application, and it splits the search
+space in half regardless.
+
 ## The ladder is not a staircase
 
 New arithmetic means you go back **down** to rung 1 or 2, every time, including
@@ -115,7 +254,8 @@ that the cheap rungs are not training wheels.
 make test_pl                  # passes
 make test_pl MUTANT=value     # data_sink corrupts one word -> the check must FAIL
 make test_pl MUTANT=short     # data_src writes n-1 words   -> the design DEADLOCKS
-make x86sim  MUTANT=aie       # the AIE vector branch shifts one bit too far
+make x86sim GRAPH=echo MUTANT=aie   # the AIE vector branch shifts one bit too far
+make run_emu MUTANT=argidx LAUNCH_HW_EMU_EXEC=1   # passes every cheap rung, hangs here
 ```
 
 With a mutant armed, the harness **inverts its verdict**: a pass becomes the
@@ -136,8 +276,10 @@ The three mutants fail in deliberately different ways:
 - `aie` is wrong **only when vectorized** — the scalar branch is untouched, so
   `make x86sim_both` reports the two branches as differing. That is the normal
   outcome of a hand-vectorization (a shift in the wrong place, a rounding mode
-  that differs, an accumulator read at the wrong precision) and it is the
-  hardest of the three to find later.
+  that differs, an accumulator read at the wrong precision).
+- `argidx` is **invisible below rung 5**. x86sim and aiesim both pass; hw_emu
+  hangs forever. See [the hole in the ladder](#the-hole-in-the-ladder) — this is
+  the most important of the four.
 
 Those are diagnosed by completely different means, and the hang is the class
 this toolchain produces most often. Meeting it once on purpose, in a rung that

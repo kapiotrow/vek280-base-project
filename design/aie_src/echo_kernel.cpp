@@ -35,7 +35,23 @@ void echo_kernel(adf::input_buffer<int32> &in,
     const int32 *__restrict ip = in.data();
     int32 *__restrict op = out.data();
 
-#if ECHO_VECTORIZE
+#if ECHO_SRC_SYNTH
+
+    // BISECT BUILD: produce a recognisable pattern without reading the input.
+    //
+    // The values are deliberately NOT the golden -- the point is to find out
+    // whether the core runs at all, and a build that could accidentally pass
+    // the golden check would answer a different question. 0xBEEF0000 + i is
+    // obvious in a hexdump and obviously not the real answer.
+    (void)ip;
+    for (unsigned i = 0; i < ECHO_N; ++i)
+    chess_prepare_for_pipelining
+    chess_loop_range(ECHO_N, ECHO_N)
+    {
+        op[i] = (int32)(0xBEEF0000u + i);
+    }
+
+#elif ECHO_VECTORIZE
 
     // The shift amount. With the mutant armed this is deliberately wrong, and
     // ONLY here -- the scalar branch below keeps the correct one.

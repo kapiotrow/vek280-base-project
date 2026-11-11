@@ -75,6 +75,27 @@ board: `strings /usr/lib/libxrt_core.so* | grep -i <key>`. And the file must be
 in the **process's working directory**, which is the FAT partition root; a copy
 in a subdirectory is inert.
 
+## PLIO
+
+**Symptom: a PLIO design hangs. No error, no timeout, no output.**
+Work through these in order, because they are ordered by how often they are the
+cause and how cheap they are to check.
+
+1. **The PLIO name contract.** The string in `input_plio::create("StreamIn", …)`
+   must match `stream_connect=…:ai_engine_0.StreamIn` in the linker config. A
+   typo is an error in neither file — it is a connection that does not exist.
+2. **XRT argument indices.** See the XRT section above. This is `MUTANT=argidx`
+   and it is the single most likely cause on a design that used to work.
+3. **The width.** 32 bits here, matching `axis_word_t`. A 128-bit PLIO on this
+   platform delivers one beat per `readincr()` and starves the kernel.
+4. **Then measure instead of guessing**: `make debug_sim && make probe_emu`.
+
+**Symptom: `aiesim` passes and the linked design deadlocks.**
+Expected, not surprising. `aiesim` feeds a PLIO from a **text file** — there is
+no PL in an AI Engine simulation at all, and the producer it gives you is
+perfectly behaved by construction. This is the ladder's most important
+limitation. `MUTANT=argidx` demonstrates it in one command.
+
 ## The AI Engine toolchain
 
 **Symptom: `make graph` fails with `use of undeclared identifier 'argc'`, on a
@@ -122,6 +143,31 @@ unit of work. On the reference project, feeding a kernel's weights once per fram
 instead of once per invocation deadlocked it, and the symptom was indistinguishable
 from a broken PLIO.
 
+**Symptom: the link fails with `Source file does not exist: libadf_<something>.a`.**
+`aiecompiler` writes its output archive as **`libadf.a`**, with that exact name,
+into the directory it is run from. The name is not configurable. So two graphs
+in one project cannot be distinguished by filename — they need separate
+directories (`build/<target>/aie_<graph>/`). Hit during this project's phase 2,
+where the compile succeeded and the link then asked for a name nothing had ever
+been going to create.
+
+**Symptom: an aiesim PLIO output file has twice as many values as expected, and
+every other one is wrong.**
+The format interleaves a timestamp line before each beat:
+
+```
+T 1388 ns
+983583391
+T 1392 ns
+-426041380
+```
+
+A parser that picks out everything which parses as an integer accepts the
+timestamps as data — `1388` is a perfectly good `int32`. Parse by line and drop
+the `T` lines. (Caught here only because the checker compares lengths; without
+that it would have reported a numerical failure and sent someone looking at the
+kernel.)
+
 **Symptom: `import argparse` fails with `AssertionError: SRE module mismatch`.**
 `source settings64.sh` sets `PYTHONHOME`/`PYTHONPATH` to Vivado's bundled
 interpreter, so `python3` runs whatever binary is on `PATH` against *Vivado's*
@@ -145,13 +191,45 @@ RTL-accurate** and are a real measurement. Do not quote one as the other.
 is the ladder's most important limitation and the reason phase 2 exists.
 
 **Symptom: waveform capture produces nothing, but the log says it succeeded.**
-*(from phase 2)* Three independent causes, each sufficient: `v++` generates
-`elaborate.sh` with `xelab --debug off`, so there is no trace information;
-packaging **regenerates** that script, dropping any patch you made; and the
-generated script carries relative include paths that resolve only in the Vivado
-project tree where v++ first ran it, so in the copied package tree they dangle
-and `xelab` fails to compile the SystemC interface **while still printing
-"Built simulation snapshot"**.
+Three independent causes, each sufficient: `v++` generates `elaborate.sh` with
+`xelab --debug off`, so there is no trace information; packaging **regenerates**
+that script, dropping any patch you made; and the generated script carries
+relative include paths that resolve only in the Vivado project tree where v++
+first ran it, so in the copied package tree they dangle and `xelab` fails to
+compile the SystemC interface **while still printing "Built simulation
+snapshot"**. `make debug_sim` handles all three and fails loudly if the tool's
+generated command has changed.
+
+**Symptom: a probe VCD from a hung run contains only the boot phase.**
+`xsim` buffers the VCD and flushes it fully only on `close_vcd`, which runs on a
+clean exit. A deadlocked run is killed, so what survives is the flushed prefix.
+Measured here: a 420 s budget against a real deadlock yielded **91.79 µs of
+simulated time** — Linux had not finished booting. `analyze_plio_vcd.py` detects
+this by the window length and declines to issue a verdict; without that check it
+reported "the producer never produced" about a window in which nothing had
+started. **`ap_start` is not a usable discriminator** — it glitches high during
+reset and reads as asserted in such a capture.
+
+**Symptom: a probe resolves none of the signals it was told to capture.**
+HLS decorates port names: an AXIS argument called `out` becomes `out_r`, and the
+decoration depends on the argument name and the tool version. Sweep by wildcard
+instead of naming paths. A probe that resolved nothing looks exactly like a link
+that moved no data.
+
+**Symptom: an `xrt::graph` design hangs with no error.**
+Somebody has to start the graph. `--package.defer_aie_run` means loading the
+xclbin does **not** enable the cores, and a graph whose cores are not running
+never drains its input PLIO. With PLIO no data passes through the host at all,
+which makes it easy to conclude that no AIE-aware host code is needed — it is
+needed for exactly one thing. This is `MUTANT=nograph`.
+
+**Symptom: `xrt::run`'s positional call operator throws `bad command state,
+can't launch`.**
+An AXI4-Stream port occupies an argument slot, so a positional assignment puts
+your scalar on the stream port. On XRT 2025.2 this aborts at launch, which is
+the good outcome. **Do not count on it** — the same mistake elsewhere produced a
+silent zero-trip loop and a hang. Always `set_arg()` by explicit index on a
+kernel with a stream port.
 
 ## Build hygiene
 

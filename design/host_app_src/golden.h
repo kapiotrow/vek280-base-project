@@ -29,8 +29,29 @@
 // distinct, non-monotone 32-bit words from a fixed seed.
 void base_fill_input(uint32_t *dst, size_t n);
 
-// The reference answer. Phase 0 is a loopback, so this is a copy -- replace the
-// body when the design acquires a datapath.
+// The AI Engine kernel's constants, as the HOST sees them.
+//
+// Deliberately named BASE_ECHO_* rather than ECHO_*: these reach the host
+// through GCC_FLAGS while ECHO_* reach the AIE kernel through --Xpreproc, and
+// both come from ONE Makefile variable each. The distinct prefix is so that a
+// reader can tell at a glance which toolchain a given spelling belongs to --
+// and so that a host file accidentally picking up the kernel's header does not
+// quietly satisfy itself with the wrong default.
+#ifndef BASE_ECHO_SHIFT
+#  define BASE_ECHO_SHIFT 1
+#endif
+#ifndef BASE_ECHO_BIAS
+#  define BASE_ECHO_BIAS 1000
+#endif
+// Elements the AIE kernel consumes per firing. The host needs it to know how
+// many graph iterations to enable: too few and the tail of the stream is never
+// consumed, which is a hang rather than an error.
+#ifndef BASE_ECHO_N
+#  define BASE_ECHO_N 256
+#endif
+
+// The reference answer: what the whole PS -> PL -> AIE -> PL -> PS chain should
+// produce. Since phase 2 that is the AIE kernel's operation, not a copy.
 void base_golden(const uint32_t *in, uint32_t *out, size_t n);
 
 // Compare `got` against `want`, print up to `max_report` mismatches, and return

@@ -35,12 +35,30 @@ void base_fill_input(uint32_t *dst, size_t n)
 
 void base_golden(const uint32_t *in, uint32_t *out, size_t n)
 {
-    // PHASE 0: the datapath is DDR -> data_src -> AXI4-Stream -> data_sink ->
-    // DDR. Nothing computes, so the reference answer is the input.
+    // PHASE 2: the AI Engine is now in the datapath, so the reference answer is
+    // no longer the input. The chain is
     //
-    // Phase 3 replaces this with the FFT/coefficient/IFFT model. The signature
-    // does not change, and neither does anything that calls it.
-    std::memcpy(out, in, n * sizeof(uint32_t));
+    //   DDR -> data_src -> PLIO -> echo_kernel -> PLIO -> data_sink -> DDR
+    //
+    // and echo_kernel computes (in >> ECHO_SHIFT) + ECHO_BIAS.
+    //
+    // THE SHIFT IS ARITHMETIC, ON A SIGNED int32. That is the one detail here
+    // that can silently disagree with the hardware: the kernel's `>>` and
+    // aie::downshift are both arithmetic shifts on int32, so the model has to
+    // sign-extend before shifting. Doing it on the unsigned value instead would
+    // be correct for half the inputs and wrong for the other half -- which is
+    // worse than being wrong for all of them, because it looks like a hardware
+    // bug rather than a modelling one.
+    //
+    // This is also the mirror of golden() in scripts/gen_vectors.py. The two
+    // exist because the host needs the model in C++ and the simulation harness
+    // needs it in Python. They are cross-checked on the STIMULUS by
+    // `make gen_vectors`; keeping the OUTPUT halves in step is still manual, so
+    // change them in the same commit.
+    for (size_t i = 0; i < n; ++i) {
+        const int32_t v = (int32_t)in[i] >> BASE_ECHO_SHIFT;
+        out[i] = (uint32_t)(v + BASE_ECHO_BIAS);
+    }
 }
 
 size_t base_compare(const uint32_t *got, const uint32_t *want, size_t n,

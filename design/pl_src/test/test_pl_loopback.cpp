@@ -52,7 +52,23 @@ int main()
 
     std::vector<uint32_t> in(N), want(N), got(N, 0xdeadbeefu);
     base_fill_input(in.data(), N);
-    base_golden(in.data(), want.data(), N);
+
+    // THE EXPECTATION HERE IS THE INPUT, NOT base_golden().
+    //
+    // base_golden() models the WHOLE chain, which since phase 2 includes the AI
+    // Engine kernel. These two PL kernels are a pure loopback: data_src reads
+    // DDR and streams it, data_sink receives it and writes it back. Nothing
+    // between them computes anything.
+    //
+    // So this rung's reference is the identity. Using base_golden() here would
+    // make the test fail for a reason that is not a defect -- which is worse
+    // than not having the test, because it trains you to ignore it.
+    //
+    // A rung's reference model has to match the SUBSET OF THE DESIGN that rung
+    // actually exercises. That is the general rule; it will matter again when
+    // phase 4 adds a PL processing stage, at which point this expectation stops
+    // being the identity and starts being that stage's operation.
+    want = in;
 
     // The kernels take ap_uint<32>*, so convert explicitly rather than cast a
     // uint32_t buffer and rely on the layout happening to agree.

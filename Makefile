@@ -1,13 +1,17 @@
 # ===========================================================================
 # VEK280 base project -- Makefile
 #
-# PHASE 1: PS + PL as in phase 0, PLUS a standalone AI Engine graph exercised
-# entirely in simulation -- gmio_echo_in -> echo_kernel -> gmio_echo_out.
+# PHASE 2: the AI Engine is IN THE DATAPATH.
 #
-# The AIE graph is NOT in the xclbin yet. It joins the system in phase 2, and it
-# stays out until then on purpose: x86sim and aiesim need no Vivado, so the
-# question "does my kernel compute the right thing" can be answered without ever
-# paying for a link.
+#   DDR -> data_src (PL) -> PLIO -> echo_kernel (AIE) -> PLIO -> data_sink -> DDR
+#
+# The kernel is byte-for-byte the one phase 1 proved; only the edges moved, from
+# GMIO to PLIO. What is new is the thing PLIO brings with it: aiesim FAKES the PL
+# boundary, feeding a PLIO from a text file, so the cheap rungs can all pass on a
+# design that deadlocks the instant it is linked.
+#
+# `MUTANT=argidx` is that gap, on demand: x86sim passes, aiesim passes, hw_emu
+# hangs forever. `make probe_emu` is how you find out why.
 #
 # Start here:
 #     source setup_env.sh
@@ -21,8 +25,9 @@
 #     make test_host    rung 1   ms      the golden model and the checker
 #     make x86sim       rung 2   s       the AIE kernel, functionally
 #     make test_pl      rung 3   s       the PL kernels' arithmetic (HLS csim)
-#     make aiesim       rung 4   min     the AIE kernel's CYCLE COST
+#     make aiesim       rung 4   min     the AIE graph, PLIO FED FROM A FILE
 #     make run_emu      rung 5   ~min    the whole system (hw_emu)
+#     make probe_emu    rung 5   ~min    ...with the AXI-Stream handshake probed
 #     (the HLS cost half of rung 4 arrives with phase 4; the numbering is kept
 #      stable so the docs stay valid)
 # ===========================================================================
@@ -45,6 +50,22 @@ BASE_N ?= 1024
 # PL kernel clock, MHz.
 PL_FREQ ?= 250
 
+# Which AI Engine graph to build.
+#   base (default)  PLIO in, PLIO out -- what goes into the xclbin (phase 2)
+#   echo            GMIO in, GMIO out -- the standalone phase-1 graph
+#
+# Both wrap THE SAME kernel. Keeping `echo` alive is deliberate: it is the only
+# configuration in which the array can be exercised with no PL, no linker config
+# and no Vivado, which makes it the right place to debug the kernel itself.
+# `make aiesim GRAPH=echo` is the phase-1 run; `make aiesim` is the phase-2 one.
+GRAPH ?= base
+
+# The bisect switch. stream (default) = the kernel reads its input.
+# synth = the kernel SYNTHESIZES its output and never reads the input, which
+# separates "the input never delivers" from "the core never runs" -- two faults
+# that are indistinguishable from outside. See echo_kernel.h.
+ECHO_SRC ?= stream
+
 # AI Engine kernel geometry and constants. ECHO_N must divide ECHO_TOTAL and be
 # a multiple of the kernel's vector width (8).
 #
@@ -64,10 +85,17 @@ ECHO_VECTORIZE ?= 1
 #   value  data_sink corrupts one word  -> the check reports a mismatch
 #   short  data_src writes n-1 words    -> the design DEADLOCKS in hw_emu
 #   aie    echo_kernel's VECTOR branch shifts one bit too far
+#   argidx the host sets data_src's args POSITIONALLY -> XRT aborts at launch
+#   nograph the host never starts the AIE graph -> the PLIO is never drained
 #
 # They fail in deliberately different ways. `value` is a wrong answer, `short`
-# is a hang, and `aie` is wrong ONLY when vectorized -- which is the normal
-# outcome of a hand-vectorization and the hardest of the three to find later.
+# is a hang, `aie` is wrong ONLY when vectorized -- the normal outcome of a
+# hand-vectorization and the hardest to find later.
+#
+# The last two are INTEGRATION mutants: both PASS EVERY CHEAP RUNG and break the
+# linked system, which is the whole lesson of phase 2. They break differently on
+# purpose -- `argidx` aborts with a message, `nograph` hangs with nothing -- and
+# the second is the one worth practising the probe on.
 MUTANT ?= none
 
 # hw_emu takes a long time and starting one by accident is a wasted afternoon,
@@ -106,28 +134,52 @@ LINK_CFG     := $(BUILD_DIR)/base.cfg
 # will eventually disagree with itself.
 # ---------------------------------------------------------------------------
 ifeq ($(MUTANT),none)
-  MUTANT_SHORT := 0
-  MUTANT_VALUE := 0
-  MUTANT_AIE   := 0
-  MUTANT_ARMED := 0
+  MUTANT_SHORT  := 0
+  MUTANT_VALUE  := 0
+  MUTANT_AIE    := 0
+  MUTANT_ARGIDX  := 0
+  MUTANT_NOGRAPH := 0
+  MUTANT_ARMED  := 0
 else ifeq ($(MUTANT),short)
-  MUTANT_SHORT := 1
-  MUTANT_VALUE := 0
-  MUTANT_AIE   := 0
-  MUTANT_ARMED := 1
+  MUTANT_SHORT  := 1
+  MUTANT_VALUE  := 0
+  MUTANT_AIE    := 0
+  MUTANT_ARGIDX  := 0
+  MUTANT_NOGRAPH := 0
+  MUTANT_ARMED  := 1
 else ifeq ($(MUTANT),value)
-  MUTANT_SHORT := 0
-  MUTANT_VALUE := 1
-  MUTANT_AIE   := 0
-  MUTANT_ARMED := 1
+  MUTANT_SHORT  := 0
+  MUTANT_VALUE  := 1
+  MUTANT_AIE    := 0
+  MUTANT_ARGIDX  := 0
+  MUTANT_NOGRAPH := 0
+  MUTANT_ARMED  := 1
 else ifeq ($(MUTANT),aie)
-  MUTANT_SHORT := 0
-  MUTANT_VALUE := 0
-  MUTANT_AIE   := 1
-  MUTANT_ARMED := 1
+  MUTANT_SHORT  := 0
+  MUTANT_VALUE  := 0
+  MUTANT_AIE    := 1
+  MUTANT_ARGIDX  := 0
+  MUTANT_NOGRAPH := 0
+  MUTANT_ARMED  := 1
+else ifeq ($(MUTANT),argidx)
+  MUTANT_SHORT   := 0
+  MUTANT_VALUE   := 0
+  MUTANT_AIE     := 0
+  MUTANT_ARGIDX  := 1
+  MUTANT_NOGRAPH := 0
+  MUTANT_ARMED   := 1
+else ifeq ($(MUTANT),nograph)
+  MUTANT_SHORT   := 0
+  MUTANT_VALUE   := 0
+  MUTANT_AIE     := 0
+  MUTANT_ARGIDX  := 0
+  MUTANT_NOGRAPH := 1
+  MUTANT_ARMED   := 1
 else
-  $(error MUTANT=$(MUTANT) is not one of: none, value, short, aie)
+  $(error MUTANT=$(MUTANT) is not one of: none, value, short, aie, argidx, nograph)
 endif
+MUTANT_ARGIDX  ?= 0
+MUTANT_NOGRAPH ?= 0
 
 MUTANT_DEFS := -D MUTANT_SHORT=$(MUTANT_SHORT) -D MUTANT_VALUE=$(MUTANT_VALUE)
 
@@ -168,15 +220,46 @@ VPP_LINK_FLAGS += --clock.freqHz $(VPP_CLOCK_FREQ):data_sink_0
 # file: change ECHO_SHIFT with a source-only prerequisite list and the build
 # cheerfully reuses the previous libadf.a.
 # ---------------------------------------------------------------------------
-AIE_WORK_DIR  := $(BUILD_DIR)/Work
+ifeq ($(GRAPH),base)
+  AIE_GRAPH_SRC := $(AIE_SRC)/base_graph.cpp
+  AIE_GRAPH_HDRS := $(AIE_SRC)/base_graph.h
+else ifeq ($(GRAPH),echo)
+  AIE_GRAPH_SRC := $(AIE_SRC)/echo_graph.cpp
+  AIE_GRAPH_HDRS := $(AIE_SRC)/echo_graph.h
+else
+  $(error GRAPH=$(GRAPH) is not one of: base, echo)
+endif
+
+# A WHOLE DIRECTORY PER GRAPH, not just a per-graph filename.
+#
+# aiecompiler writes its output archive as `libadf.a`, with that exact name,
+# into the directory it is run from -- the name is not configurable. So two
+# graphs cannot be told apart by filename; they have to be told apart by
+# location. (Trying the filename first produced a build that compiled the graph
+# happily and then failed at the link with "Source file does not exist:
+# libadf_base.a", because nothing had ever been going to create that name.)
+#
+# Separating them matters for the same reason the flag stamps exist: two graphs
+# sharing one output path is a stale-artifact trap, and this one would not even
+# be caught by a stamp.
+AIE_BUILD_DIR := $(BUILD_DIR)/aie_$(GRAPH)
+AIE_WORK_DIR  := $(AIE_BUILD_DIR)/Work
 AIE_DATA_DIR  := $(AIE_SRC)/aiesim_data/echo
-AIE_GRAPH_SRC := $(AIE_SRC)/echo_graph.cpp
+
+ifeq ($(ECHO_SRC),stream)
+  ECHO_SRC_SYNTH := 0
+else ifeq ($(ECHO_SRC),synth)
+  ECHO_SRC_SYNTH := 1
+else
+  $(error ECHO_SRC=$(ECHO_SRC) is not one of: stream, synth)
+endif
 
 AIE_DEFS := --Xpreproc="-DECHO_N=$(ECHO_N)"
 AIE_DEFS += --Xpreproc="-DECHO_TOTAL=$(ECHO_TOTAL)"
 AIE_DEFS += --Xpreproc="-DECHO_SHIFT=$(ECHO_SHIFT)"
 AIE_DEFS += --Xpreproc="-DECHO_BIAS=$(ECHO_BIAS)"
 AIE_DEFS += --Xpreproc="-DECHO_VECTORIZE=$(ECHO_VECTORIZE)"
+AIE_DEFS += --Xpreproc="-DECHO_SRC_SYNTH=$(ECHO_SRC_SYNTH)"
 AIE_DEFS += --Xpreproc="-DMUTANT_AIE=$(MUTANT_AIE)"
 
 AIE_FLAGS_COMMON := --platform=$(PLATFORM)
@@ -191,14 +274,14 @@ AIE_FLAGS := --target=hw
 AIE_FLAGS += $(AIE_FLAGS_COMMON)
 AIE_FLAGS += --workdir=$(AIE_WORK_DIR)
 
-LIBADF_A := $(BUILD_DIR)/libadf.a
+LIBADF_A := $(AIE_BUILD_DIR)/libadf.a
 
 # x86sim builds to its own tree: a different target, a different Work/, and no
 # relationship to $(TARGET) at all -- x86sim is not hw_emu.
 #
 # The workdir is ABSOLUTE because the recipe cd's into the build directory
 # first, and a relative --workdir would land somewhere unintended.
-X86_BUILD_DIR := $(PROJECT_ROOT)/build/x86sim
+X86_BUILD_DIR := $(PROJECT_ROOT)/build/x86sim_$(GRAPH)
 X86_WORK_DIR  := $(X86_BUILD_DIR)/Work
 
 X86_AIE_FLAGS := --target=x86sim
@@ -252,6 +335,31 @@ AIESIM_CYCLE_TIMEOUT ?= 100000
 
 AIE_SIM_FLAGS := --pkg-dir=$(AIE_WORK_DIR)
 AIE_SIM_FLAGS += --simulation-cycle-timeout=$(AIESIM_CYCLE_TIMEOUT)
+# -i names the directory aiesim reads PLIO input files from. For GRAPH=echo
+# there are no PLIO ports and it is simply unused.
+AIE_SIM_FLAGS += -i=$(AIE_DATA_DIR)
+
+# WHERE THE ANSWER ENDS UP, and it differs between the two graphs because the
+# two mechanisms are different:
+#
+#   GRAPH=echo  the HARNESS writes echo_out.bin with its own fwrite, having
+#               pulled the data back over GMIO itself.
+#   GRAPH=base  AIESIM writes stream_out.txt, from the PLIO declaration in the
+#               graph. The harness does not touch the data at all -- which is
+#               precisely why this graph's harness is ten lines long, and
+#               precisely why it proves so much less.
+ifeq ($(GRAPH),base)
+  AIESIM_ACTUAL   := $(AIE_BUILD_DIR)/aiesimulator_output/stream_out.txt
+  AIESIM_TEXTFLAG := --actual-text
+else
+  AIESIM_ACTUAL   := $(AIE_BUILD_DIR)/echo_out.bin
+  AIESIM_TEXTFLAG :=
+endif
+
+# ECHO_SRC=synth is a DIAGNOSTIC build, not a test: the kernel deliberately
+# ignores its input, so the golden cannot apply. The checker is told to report
+# "did the core run" instead of pass/fail.
+SYNTH_FLAG := $(if $(filter 1,$(ECHO_SRC_SYNTH)),--synth-probe --synth-period $(ECHO_N),)
 
 # With a mutant armed, the checker INVERTS its verdict: a match becomes the
 # failure. One variable, so the two simulation rungs cannot disagree about it.
@@ -274,15 +382,29 @@ CHECK_EXPECT := $(if $(SIM_MUTANT_EFFECTIVE),--expect-fail,)
 # ---------------------------------------------------------------------------
 # Host compile flags (cross, for the board/emulated APU)
 # ---------------------------------------------------------------------------
-GCC_FLAGS := -O2 -std=c++17 -D__linux__
+# __PS_ENABLE_AIE__ is required by the XRT AIE headers.
+GCC_FLAGS := -O2 -std=c++17 -D__linux__ -D__PS_ENABLE_AIE__
 GCC_FLAGS += -DBASE_N=$(BASE_N)
 GCC_FLAGS += -DMUTANT_ARMED=$(MUTANT_ARMED)
+GCC_FLAGS += -DMUTANT_ARGIDX=$(MUTANT_ARGIDX)
+GCC_FLAGS += -DMUTANT_NOGRAPH=$(MUTANT_NOGRAPH)
+# The AIE kernel's constants, so the host's golden models what the array does.
+# ONE Makefile variable reaches both toolchains -- --Xpreproc for the kernel,
+# -D for the host. Deriving them separately is how the two come to disagree.
+GCC_FLAGS += -DBASE_ECHO_SHIFT=$(ECHO_SHIFT)
+GCC_FLAGS += -DBASE_ECHO_BIAS=$(ECHO_BIAS)
+GCC_FLAGS += -DBASE_ECHO_N=$(ECHO_N)
 
 GCC_INC := -I$(SDKTARGETSYSROOT)/usr/include/xrt
 GCC_INC += -I$(SDKTARGETSYSROOT)/usr/include
+GCC_INC += -I$(XILINX_VITIS)/aietools/include
 GCC_INC += -I$(HOST_SRC)
 
-GCC_LIBS := -L$(SDKTARGETSYSROOT)/usr/lib -lxrt_coreutil
+# -ladf_api_xrt is what xrt::graph needs. It lives in aietools, not the sysroot,
+# and it is the one host-side dependency the AI Engine adds.
+GCC_LIBS := -L$(SDKTARGETSYSROOT)/usr/lib
+GCC_LIBS += -L$(XILINX_VITIS)/aietools/lib/aarch64.o
+GCC_LIBS += -ladf_api_xrt -lxrt_coreutil
 
 # Native compiler for the rung-1 and rung-3 tests. NOT $(CXX): that one is the
 # aarch64 cross compiler and its output cannot run here.
@@ -311,7 +433,7 @@ PYTHON := env -u PYTHONHOME -u PYTHONPATH python3
 
 help:
 	@echo ""
-	@echo "VEK280 base project -- phase 1 (PS + PL + a simulated AIE graph)"
+	@echo "VEK280 base project -- phase 2 (PS + PL + AIE, all in the datapath)"
 	@echo ""
 	@echo "  FIRST:         source setup_env.sh && make check_env"
 	@echo ""
@@ -320,8 +442,10 @@ help:
 	@echo "    x86sim         rung 2  s    the AIE kernel, functionally"
 	@echo "    x86sim_both    rung 2  s    ...both branches, diffed bit for bit"
 	@echo "    test_pl        rung 3  s    PL kernels, HLS C simulation"
-	@echo "    aiesim         rung 4  min  the AIE kernel's CYCLE COST"
+	@echo "    aiesim         rung 4  min  the AIE graph -- PLIO FED FROM A FILE"
 	@echo "    run_emu        rung 5  min  full system in hw_emu"
+	@echo "    debug_sim           --      re-elaborate the snapshot with trace info"
+	@echo "    probe_emu      rung 5  min  ...run with the AXI-Stream handshake probed"
 	@echo ""
 	@echo "  Build steps (each one is also the name of what it produces):"
 	@echo "    gen_vectors    stimulus + golden, cross-checked against the C++ one"
@@ -340,7 +464,9 @@ help:
 	@echo "    ECHO_N=$(ECHO_N) ECHO_TOTAL=$(ECHO_TOTAL)   AIE elements per firing / in total"
 	@echo "    ECHO_SHIFT=$(ECHO_SHIFT) ECHO_BIAS=$(ECHO_BIAS)      out = (in >> SHIFT) + BIAS"
 	@echo "    ECHO_VECTORIZE=$(ECHO_VECTORIZE)       1 = vector branch, 0 = scalar reference"
-	@echo "    MUTANT=$(MUTANT)        none | value | short | aie"
+	@echo "    GRAPH=$(GRAPH)          base (PLIO, in the xclbin) | echo (GMIO, sim only)"
+	@echo "    ECHO_SRC=$(ECHO_SRC)    stream | synth   (the bisect switch)"
+	@echo "    MUTANT=$(MUTANT)        none|value|short|aie|argidx|nograph"
 	@echo "    LAUNCH_HW_EMU_EXEC=$(LAUNCH_HW_EMU_EXEC)  must be 1 for run_emu"
 	@echo ""
 	@echo "  make print-<KNOB>   print one default (what the docs quote)"
@@ -388,6 +514,7 @@ $(APP_FLAGS_STAMP): FLAGS_FOR_STAMP := $(GCC_FLAGS)
 test_host:
 	@mkdir -p $(BUILD_DIR)
 	$(HOST_CXX) -O2 -std=c++17 -Wall -Wextra \
+	    -DBASE_ECHO_SHIFT=$(ECHO_SHIFT) -DBASE_ECHO_BIAS=$(ECHO_BIAS) \
 	    $(HOST_SRC)/test/test_golden.cpp $(HOST_SRC)/golden.cpp \
 	    -o $(BUILD_DIR)/test_golden
 	@echo ""
@@ -406,6 +533,7 @@ test_pl:
 	@mkdir -p $(BUILD_DIR)
 	$(HOST_CXX) -O2 -std=c++17 -Wall -Wno-unknown-pragmas \
 	    -isystem $(XILINX_VITIS)/include $(MUTANT_DEFS) \
+	    -DBASE_ECHO_SHIFT=$(ECHO_SHIFT) -DBASE_ECHO_BIAS=$(ECHO_BIAS) \
 	    $(PL_SRC)/test/test_pl_loopback.cpp $(HOST_SRC)/golden.cpp \
 	    -o $(BUILD_DIR)/test_pl
 	@echo ""
@@ -439,20 +567,20 @@ gen_vectors:
 # for when the question is about the array rather than the system -- on the
 # reference project it answers in ~5 minutes what a full package costs 25.
 # ---------------------------------------------------------------------------
-AIE_FLAGS_STAMP := $(BUILD_DIR)/aie.flagstamp
+AIE_FLAGS_STAMP := $(AIE_BUILD_DIR)/aie.flagstamp
 $(AIE_FLAGS_STAMP): FLAGS_FOR_STAMP := $(AIE_FLAGS)
 
 .PHONY: graph
 graph: $(LIBADF_A)
 
-$(LIBADF_A): $(AIE_FLAGS_STAMP) $(AIE_GRAPH_SRC) \
-             $(AIE_SRC)/echo_graph.h $(AIE_SRC)/echo_kernel.h $(AIE_SRC)/echo_kernel.cpp
-	@mkdir -p $(BUILD_DIR)
-	@echo "aiecompiler --target=hw ... -> $(BUILD_DIR)/aiecompiler.log"
-	@cd $(BUILD_DIR) && aiecompiler $(AIE_FLAGS) $(AIE_GRAPH_SRC) > aiecompiler.log 2>&1 \
+$(LIBADF_A): $(AIE_FLAGS_STAMP) $(AIE_GRAPH_SRC) $(AIE_GRAPH_HDRS) \
+             $(AIE_SRC)/echo_kernel.h $(AIE_SRC)/echo_kernel.cpp
+	@mkdir -p $(AIE_BUILD_DIR)
+	@echo "aiecompiler --target=hw GRAPH=$(GRAPH) -> $(AIE_BUILD_DIR)/aiecompiler.log"
+	@cd $(AIE_BUILD_DIR) && aiecompiler $(AIE_FLAGS) $(AIE_GRAPH_SRC) > aiecompiler.log 2>&1 \
 	    || { echo "AIE COMPILE FAILED -- last 40 lines:"; tail -40 aiecompiler.log; exit 1; }
-	@grep -cE "^(ERROR|WARNING)" $(BUILD_DIR)/aiecompiler.log >/dev/null 2>&1 && \
-	    grep -E "^(ERROR|WARNING)" $(BUILD_DIR)/aiecompiler.log | head -5 || true
+	@grep -cE "^(ERROR|WARNING)" $(AIE_BUILD_DIR)/aiecompiler.log >/dev/null 2>&1 && \
+	    grep -E "^(ERROR|WARNING)" $(AIE_BUILD_DIR)/aiecompiler.log | head -5 || true
 	@echo "graph: $(LIBADF_A)"
 	@echo ""
 	@echo "--- the compiler's SCHEDULE for each kernel. NOT a measurement: it is"
@@ -472,8 +600,8 @@ X86_FLAGS_STAMP := $(X86_BUILD_DIR)/aie.flagstamp
 $(X86_FLAGS_STAMP): FLAGS_FOR_STAMP := $(X86_AIE_FLAGS)
 
 .PHONY: x86sim_graph x86sim
-x86sim_graph: $(X86_FLAGS_STAMP) $(AIE_GRAPH_SRC) \
-              $(AIE_SRC)/echo_graph.h $(AIE_SRC)/echo_kernel.h $(AIE_SRC)/echo_kernel.cpp
+x86sim_graph: $(X86_FLAGS_STAMP) $(AIE_GRAPH_SRC) $(AIE_GRAPH_HDRS) \
+              $(AIE_SRC)/echo_kernel.h $(AIE_SRC)/echo_kernel.cpp
 	@mkdir -p $(X86_BUILD_DIR)
 	@echo "aiecompiler --target=x86sim ... -> $(X86_BUILD_DIR)/aiecompiler_x86.log"
 	@cd $(X86_BUILD_DIR) && aiecompiler $(X86_AIE_FLAGS) $(AIE_GRAPH_SRC) \
@@ -481,6 +609,18 @@ x86sim_graph: $(X86_FLAGS_STAMP) $(AIE_GRAPH_SRC) \
 	    || { echo "AIE COMPILE FAILED -- last 40 lines:"; tail -40 aiecompiler_x86.log; exit 1; }
 
 x86sim: x86sim_graph gen_vectors
+	@test "$(GRAPH)" = "echo" || { \
+	    echo "ERROR: x86sim needs GRAPH=echo."; \
+	    echo ""; \
+	    echo "  The PLIO graph's harness performs no I/O of its own -- aiesim"; \
+	    echo "  reads and writes the PLIO files itself, and x86simulator does"; \
+	    echo "  not do that. So there would be nothing to check."; \
+	    echo ""; \
+	    echo "  The kernel is the SAME in both graphs, which is the point:"; \
+	    echo "  prove it on the GMIO graph, where it is cheap, then link it."; \
+	    echo ""; \
+	    echo "    make x86sim GRAPH=echo"; \
+	    exit 1; }
 	rm -f $(X86_BUILD_DIR)/echo_out.bin   # see the note in the aiesim recipe
 	cd $(X86_BUILD_DIR) && \
 	    ECHO_DATA_DIR=$(AIE_DATA_DIR) ECHO_OUT_DIR=$(X86_BUILD_DIR) \
@@ -488,7 +628,7 @@ x86sim: x86sim_graph gen_vectors
 	@echo ""
 	$(PYTHON) $(SCRIPTS)/check_sim_output.py \
 	    --actual $(X86_BUILD_DIR)/echo_out.bin \
-	    --golden $(AIE_DATA_DIR)/golden.bin $(CHECK_EXPECT)
+	    --golden $(AIE_DATA_DIR)/golden.bin $(CHECK_EXPECT) $(SYNTH_FLAG)
 
 # The equality the vectorized kernel is only worth having if it holds: run both
 # branches through rung 2 and diff the dumps byte for byte.
@@ -496,13 +636,14 @@ x86sim: x86sim_graph gen_vectors
 # "Bit-identical" is a claim, not a hope. A hand-vectorization that merely
 # agrees to within an LSB has a rounding difference you have not found yet.
 .PHONY: x86sim_both
+x86sim_both: GRAPH := echo
 x86sim_both:
 	@echo "=== ECHO_VECTORIZE=1 (vectorized) ==="
-	@$(MAKE) --no-print-directory x86sim ECHO_VECTORIZE=1
+	@$(MAKE) --no-print-directory x86sim GRAPH=echo ECHO_VECTORIZE=1
 	@cp $(X86_BUILD_DIR)/echo_out.bin $(BUILD_DIR)/echo_out_vec.bin
 	@echo ""
 	@echo "=== ECHO_VECTORIZE=0 (scalar reference) ==="
-	@$(MAKE) --no-print-directory x86sim ECHO_VECTORIZE=0
+	@$(MAKE) --no-print-directory x86sim GRAPH=echo ECHO_VECTORIZE=0
 	@cp $(X86_BUILD_DIR)/echo_out.bin $(BUILD_DIR)/echo_out_scalar.bin
 	@echo ""
 	@echo "=== vectorized vs scalar ==="
@@ -547,14 +688,22 @@ aiesim: graph gen_vectors
 	@# mis-expanded flag stopped aiesimulator from launching and the rung
 	@# reported success. A checker that can pass without its input having been
 	@# produced is not a checker.
-	rm -f $(BUILD_DIR)/echo_out.bin
-	-cd $(BUILD_DIR) && \
-	    ECHO_DATA_DIR=$(AIE_DATA_DIR) ECHO_OUT_DIR=$(BUILD_DIR) \
+	rm -f $(AIESIM_ACTUAL)
+	-cd $(AIE_BUILD_DIR) && \
+	    ECHO_DATA_DIR=$(AIE_DATA_DIR) ECHO_OUT_DIR=$(AIE_BUILD_DIR) \
 	    timeout $(SIM_WALL_TIMEOUT) aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
 	@echo ""
+	@echo "--- GRAPH=$(GRAPH): checking $(AIESIM_ACTUAL)"
+ifeq ($(GRAPH),base)
+	@echo "--- REMEMBER WHAT THIS RUN DID NOT TEST: the PLIO was fed from"
+	@echo "--- $(AIE_DATA_DIR)/stream_in.txt, not by data_src."
+	@echo "--- There is no PL in an AIE simulation. A PASS here is consistent"
+	@echo "--- with a design that deadlocks the moment it is linked."
+	@echo "--- Try: make run_emu MUTANT=argidx LAUNCH_HW_EMU_EXEC=1"
+endif
 	$(PYTHON) $(SCRIPTS)/check_sim_output.py \
-	    --actual $(BUILD_DIR)/echo_out.bin \
-	    --golden $(AIE_DATA_DIR)/golden.bin $(CHECK_EXPECT)
+	    --actual $(AIESIM_ACTUAL) $(AIESIM_TEXTFLAG) \
+	    --golden $(AIE_DATA_DIR)/golden.bin $(CHECK_EXPECT) $(SYNTH_FLAG)
 
 # ---------------------------------------------------------------------------
 # PL kernels: HLS -> .xo
@@ -589,8 +738,15 @@ $(LINK_CFG): $(SYS_CONFIGS)/base.cfg.in
 .PHONY: xsa
 xsa: $(BUILD_DIR)/$(XSA)
 
-$(BUILD_DIR)/$(XSA): $(KERNEL_XOS) $(LINK_CFG)
-	v++ $(VPP_FLAGS) $(VPP_LINK_FLAGS) -l $(KERNEL_XOS) \
+# The AIE graph is now part of the system, so libadf.a is a link input.
+# GRAPH must be `base` here: the `echo` graph has GMIO ports and no PLIO, so it
+# satisfies none of the stream_connect lines in the linker config.
+$(BUILD_DIR)/$(XSA): $(KERNEL_XOS) $(LIBADF_A) $(LINK_CFG)
+	@test "$(GRAPH)" = "base" || { \
+	    echo "ERROR: the xclbin needs the PLIO graph. Use GRAPH=base (the default)."; \
+	    echo "       GRAPH=echo is the standalone GMIO graph -- simulation only."; \
+	    exit 1; }
+	v++ $(VPP_FLAGS) $(VPP_LINK_FLAGS) -l $(KERNEL_XOS) $(LIBADF_A) \
 	    -o $@ 2>&1 | tee $(BUILD_DIR)/vpp_link.log
 
 # ---------------------------------------------------------------------------
@@ -642,7 +798,15 @@ $(BUILD_DIR)/run_script.sh: $(EXEC_SCRIPTS)/run_script.sh
 # Package: .xsa + ELF + rootfs + kernel image -> bootable image / emu package
 # ---------------------------------------------------------------------------
 .PHONY: package
-package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(ROOTFS) \
+# --package.defer_aie_run: do NOT start the AIE graph at boot.
+#
+# In this design the graph is driven entirely by the two PL kernels over PLIO,
+# and the host never touches it. The packager would otherwise arrange for the
+# graph to be started as part of loading the xclbin, which is harmless here but
+# makes the control flow a lie: it hides WHO starts the array. Deferring it keeps
+# that explicit, and it is required as soon as a host wants to configure the
+# graph before it runs.
+package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A) $(ROOTFS) \
          $(BUILD_DIR)/run_script.sh
 	v++ --package $(VPP_FLAGS) \
 	    --package.rootfs $(ROOTFS) \
@@ -653,10 +817,11 @@ package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(ROOTFS) \
 	    --package.sd_file $(BUILD_DIR)/$(APP_ELF) \
 	    --package.sd_file $(BUILD_DIR)/run_script.sh \
 	    --package.sd_file $(PROFILING)/xrt.ini \
-	    $(BUILD_DIR)/$(XSA)
+	    --package.defer_aie_run \
+	    $(BUILD_DIR)/$(XSA) $(LIBADF_A)
 
 .PHONY: sd_card
-sd_card: kernels xsa application package
+sd_card: kernels graph xsa application package
 
 # ---------------------------------------------------------------------------
 # Rung 5: hw_emu
@@ -665,21 +830,129 @@ sd_card: kernels xsa application package
 # recoverable if you did not mean to start it.
 #
 # -no-reboot reuses the already-booted image, which is most of the wall time.
+#
+# EMU_WALL_TIMEOUT bounds the run. A phase-2 deadlock produces no output at all,
+# so without this a hung emulation runs until someone notices.
 # ---------------------------------------------------------------------------
+EMU_WALL_TIMEOUT ?= 900
 .PHONY: run_emu
 run_emu:
 ifeq ($(LAUNCH_HW_EMU_EXEC),1)
 	@test -d $(PKG_OUT) || { echo "ERROR: no package -- run 'make sd_card' first"; exit 1; }
-	cd $(PKG_OUT) && ./launch_hw_emu.sh -no-reboot -run-app run_script.sh 2>&1 \
+	@# THE TIMEOUT IS NOT OPTIONAL HERE. Since phase 2 this project ships a
+	@# mutant whose whole purpose is to hang (MUTANT=argidx), and a genuine
+	@# PLIO deadlock produces no error and no output -- so an unbounded run_emu
+	@# waits forever and takes the terminal with it. Ask me how I know.
+	-cd $(PKG_OUT) && timeout $(EMU_WALL_TIMEOUT) \
+	    ./launch_hw_emu.sh -no-reboot -run-app run_script.sh 2>&1 \
 	    | tee $(BUILD_DIR)/run_emu.log
 	@echo ""
 	@echo "---- verdict ----"
 	@grep -E "\[host\]|TEST PASSED|ERROR:" $(BUILD_DIR)/run_emu.log || true
+	@# A run that produced no PASS/FAIL line did not finish. Say so, rather
+	@# than letting a silent exit look like success.
+	@if ! grep -qE "\[host\] (PASS|FAIL|mutant detected)" $(BUILD_DIR)/run_emu.log; then \
+	    echo ""; \
+	    echo "NO VERDICT: the run did not reach its own check."; \
+	    echo "  The last [host] line above is where it stopped. If it is"; \
+	    echo "  'waiting for ...', this is a DEADLOCK -- see docs/04-dev-cycle.md"; \
+	    echo "  and run:  make debug_sim && make probe_emu LAUNCH_HW_EMU_EXEC=1"; \
+	    exit 1; \
+	fi
 else
 	@echo "hw_emu is slow and starting one by accident wastes an afternoon."
 	@echo "Run it on purpose:"
 	@echo "    make run_emu LAUNCH_HW_EMU_EXEC=1"
 endif
+
+# ---------------------------------------------------------------------------
+# The AXI4-Stream handshake probe.
+#
+# This is phase 2's debugging tool, and the one the rest of the ladder cannot
+# substitute for. When a PLIO design hangs you get no error, no timeout and no
+# output; TVALID and TREADY tell you in one glance which side is at fault.
+#
+#     make debug_sim    re-elaborate the emulation snapshot WITH trace info
+#     make probe_emu    run it with the probe armed, then analyse the VCD
+#
+# debug_sim must be re-run after every `make package`, because packaging
+# regenerates elaborate.sh and drops the patch.
+# ---------------------------------------------------------------------------
+XSIM_DIR := $(PKG_OUT)/sim/behav_waveform/xsim
+
+# Which stream to probe. The default is the PL->AIE direction, which is where a
+# starved AIE kernel shows up. For the AIE->PL direction use:
+#     make probe_emu PROBE_CU=data_sink_0 PROBE_PORT=in
+PROBE_CU   ?= data_src_0
+PROBE_PORT ?= out
+
+.PHONY: debug_sim probe_emu
+debug_sim:
+	@test -f $(XSIM_DIR)/elaborate.sh || { \
+	    echo "ERROR: $(XSIM_DIR)/elaborate.sh missing -- run 'make package' first"; exit 1; }
+	@# THREE SEPARATE THINGS EACH DEFEAT WAVEFORM CAPTURE, AND ALL THREE ARE SILENT.
+	@#
+	@# 1. v++ generates elaborate.sh with `xelab --incr --debug off`, so the
+	@#    snapshot carries NO trace information. log_vcd then fails with
+	@#    "[Simulator 45-10] ... compiled without trace information", and since
+	@#    simulate.sh runs xsim with -onerror quit, that error kills the whole
+	@#    emulation before Linux boots.
+	@#
+	@# 2. `--incr` is dropped deliberately. Incremental reuse across a CHANGED
+	@#    --debug setting is what produces a snapshot that still lacks trace data
+	@#    while reporting success.
+	@#
+	@# 3. elaborate.sh carries RELATIVE include paths (../../../../prj.ip_user_files/...)
+	@#    that resolve only in the Vivado project tree where v++ originally ran it.
+	@#    In the copied package tree they dangle, xelab fails to compile the
+	@#    SystemC interface -- and STILL PRINTS "Built simulation snapshot".
+	@#    A broken snapshot that looks successful. From the xsim dir, ../../../../
+	@#    is the build dir, so the prj.* trees are linked there.
+	cp -f $(XSIM_DIR)/elaborate.sh $(XSIM_DIR)/elaborate.sh.orig
+	sed -i 's/xelab --incr --debug off /xelab --debug typical /g' $(XSIM_DIR)/elaborate.sh
+	@grep -q -- '--debug typical' $(XSIM_DIR)/elaborate.sh || { \
+	    echo "ERROR: elaborate.sh did not match the expected xelab flags."; \
+	    echo "       Inspect it by hand -- the tool's generated command changed."; \
+	    exit 1; }
+	ln -sfn _x/link/vivado/vpl/prj/prj.ip_user_files $(BUILD_DIR)/prj.ip_user_files
+	ln -sfn _x/link/vivado/vpl/prj/prj.gen           $(BUILD_DIR)/prj.gen
+	rm -rf $(XSIM_DIR)/xsim.dir/tb_behav
+	cd $(XSIM_DIR) && ./elaborate.sh 2>&1 | tee elaborate_debug.log
+	@# "Built simulation snapshot" is NOT sufficient -- see note 3 above.
+	@if grep -qi "No such file or directory" $(XSIM_DIR)/elaborate_debug.log; then \
+	    echo "ERROR: elaboration still has unresolved includes -- the snapshot is"; \
+	    echo "       not trustworthy, whatever the success message says."; \
+	    exit 1; \
+	fi
+	@echo "debug_sim: snapshot re-elaborated with trace information."
+
+probe_emu:
+ifeq ($(LAUNCH_HW_EMU_EXEC),1)
+	@test -d $(PKG_OUT) || { echo "ERROR: no package -- run 'make sd_card' first"; exit 1; }
+	@test -f $(XSIM_DIR)/elaborate_debug.log || { \
+	    echo "ERROR: run 'make debug_sim' first -- the stock snapshot has no trace info."; \
+	    exit 1; }
+	rm -f $(XSIM_DIR)/plio_probe.vcd
+	-cd $(PKG_OUT) && USER_PRE_SIM_SCRIPT=$(EXEC_SCRIPTS)/plio_probe.tcl \
+	    PROBE_CU=$(PROBE_CU) PROBE_PORT=$(PROBE_PORT) \
+	    timeout $(PROBE_WALL_TIMEOUT) ./launch_hw_emu.sh -no-reboot -run-app run_script.sh \
+	    2>&1 | tee $(BUILD_DIR)/probe_emu.log
+	@echo ""
+	@echo "--- which signals the probe actually resolved ---"
+	@grep -E "plio_probe:|  (OK|MISSING) " $(BUILD_DIR)/probe_emu.log | head -30 || true
+	@echo ""
+	@echo "--- handshake analysis ---"
+	$(PYTHON) $(SCRIPTS)/analyze_plio_vcd.py $(XSIM_DIR)/plio_probe.vcd $(BASE_N)
+else
+	@echo "probe_emu runs an hw_emu. Run it on purpose:"
+	@echo "    make debug_sim                               # once per package"
+	@echo "    make probe_emu LAUNCH_HW_EMU_EXEC=1"
+endif
+
+# A probe run is expected to HANG when it is doing its job -- that is the whole
+# point -- so it gets its own, shorter wall timeout. The VCD is written
+# incrementally, so a killed run still leaves a parseable file.
+PROBE_WALL_TIMEOUT ?= 900
 
 # ---------------------------------------------------------------------------
 .PHONY: clean cleanall

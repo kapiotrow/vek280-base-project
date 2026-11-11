@@ -12,7 +12,7 @@ see. On this toolchain that is where the time goes.
 > **Read [`docs/04-dev-cycle.md`](docs/04-dev-cycle.md) first.** If you read
 > nothing else, read that.
 
-## Status: phase 1 — PS + PL + a simulated AI Engine graph
+## Status: phase 2 — PS + PL + AI Engine, all three in one datapath
 
 The project is built in phases, each one a working design, each one adding both
 a piece of hardware and the verification rung that goes with it.
@@ -20,8 +20,8 @@ a piece of hardware and the verification rung that goes with it.
 | phase | design | rungs it introduces |
 |---|---|---|
 | 0 | `data_src` → AXI4-Stream → `data_sink`, driven by XRT | `check_env`, HLS C-sim, hw_emu |
-| **1 (here)** | a GMIO echo kernel on the AI Engine, in simulation only | x86sim, aiesim, `make graph` |
-| 2 | the AI Engine fed by the real PL stream (PLIO) | the AXI-Stream probe, the bisect build |
+| 1 | a GMIO echo kernel on the AI Engine, in simulation only | x86sim, aiesim, `make graph` |
+| **2 (here)** | the AI Engine fed by the real PL stream (PLIO) | the handshake probe, the bisect build |
 | 3 | DSPLib FFT / IFFT with a host-supplied coefficient vector | *back down* to x86sim — on purpose |
 | 4 | a PL processing stage with a runtime register | the HLS cost report, cycle measurement |
 | 5 | real hardware | the board |
@@ -50,6 +50,9 @@ minute. That is not a coincidence, it is the method — see
 [`docs/04-dev-cycle.md`](docs/04-dev-cycle.md).
 
 `make help` lists everything with its current knob values.
+
+**What is left to build** — phases 3–5, with what is already known about each —
+is in [`docs/07-roadmap.md`](docs/07-roadmap.md).
 
 ## What the design does
 
@@ -81,30 +84,32 @@ you to eyeball. On `hw_emu` it reads:
 [host] PASS -- all 1024 words correct
 ```
 
-Alongside it, and **not yet in the xclbin**, is the AI Engine graph:
+The AI Engine sits in the middle of that stream:
 
 ```
-   DDR ──GMIO──▶ echo_kernel ──GMIO──▶ DDR          AIE (1 core of 304)
+   PLIO ──▶ echo_kernel ──▶ PLIO        AIE (1 core of 304, 2 tiles)
 
    out[i] = (in[i] >> ECHO_SHIFT) + ECHO_BIAS
 ```
 
-One core, two tiles, and an inner loop the compiler schedules into a single VLIW
-bundle — one cycle per 8 int32 elements. It stays out of the system until phase 2
-because x86sim and aiesim need no Vivado, so a kernel can be written, proven
-bit-exact and costed without ever paying for a link.
+An inner loop the compiler schedules into a **single VLIW bundle** — one cycle
+per 8 `int32`. The kernel exists in **two implementations**, vectorized and
+scalar, and `make x86sim_both` diffs them byte for byte: a hand-vectorization is
+only worth having if you can show it is numerically free. (It is, here, and the
+reason is specific — `aie::downshift` does not round.)
 
-The kernel exists in **two implementations**, vectorized and scalar, and
-`make x86sim_both` diffs them byte for byte. That is the habit the phase is
-really for: a hand-vectorization is only worth having if you can show it is
-numerically free.
+The same kernel also runs in a **GMIO-only graph** (`GRAPH=echo`) with no PL, no
+linker config and no Vivado. That is where you debug the kernel itself; the PLIO
+graph is where you find out whether the plumbing works. Two different questions,
+two different rungs.
 
 ## The mutant switch
 
 ```bash
 make test_pl MUTANT=value     # one word is corrupted -> the check must FAIL
 make test_pl MUTANT=short     # one word is missing   -> the design DEADLOCKS
-make x86sim  MUTANT=aie       # the AIE vector branch is wrong, the scalar one is not
+make x86sim GRAPH=echo MUTANT=aie   # the AIE vector branch is wrong, the scalar one is not
+make run_emu MUTANT=argidx LAUNCH_HW_EMU_EXEC=1   # see below
 ```
 
 Every verification step in this project can be made to fail on purpose, and with
@@ -113,6 +118,36 @@ a mutant armed the harness **inverts its verdict** — a pass becomes the failur
 Run each one once. A check that has never been observed to fail is not known to
 work, and from the outside the two are identical: a comparison that silently
 compares nothing prints exactly what a passing one prints.
+
+### The one that matters: `MUTANT=argidx`
+
+```
+make x86sim GRAPH=echo MUTANT=argidx   →  PASS
+make aiesim MUTANT=argidx              →  PASS
+make run_emu MUTANT=argidx             →  HANGS FOREVER
+```
+
+One line in the host: `r_src(in_bo, n)` instead of `set_arg()` by index. An
+AXI4-Stream port occupies an argument slot even though it is not a settable
+register, so `n` lands on the stream port, `data_src` runs a zero-trip loop, and
+the AI Engine blocks forever on an input that never comes.
+
+**The cheap rungs cannot see it** — x86sim and aiesim contain no host and no PL,
+and aiesim feeds the PLIO from a text file, i.e. from a producer that is
+perfectly behaved by construction. Integration is its own category of defect and
+rung 5 is the first rung that has all three parts in it.
+
+This is the reference project's real bug. It cost about a week, during which the
+fault was believed to be in the PLIO width, the shim placement, the port
+allocation, and eventually the viability of PLIO itself — because *"no data
+arrives"* is what every one of those also looks like.
+
+When it hangs:
+
+```bash
+make debug_sim                               # once per package
+make probe_emu LAUNCH_HW_EMU_EXEC=1          # TVALID/TREADY + a verdict
+```
 
 ## Layout
 
@@ -124,8 +159,11 @@ design/
 │   ├── data_sink/       AXI4-Stream -> LPDDR
 │   └── test/            rung 3: HLS C simulation, native, seconds
 ├── aie_src/
-│   ├── echo_kernel.{h,cpp}   one AIE kernel, vectorized AND scalar
-│   ├── echo_graph.{h,cpp}    the graph, plus the x86sim/aiesim harness
+│   ├── echo_kernel.{h,cpp}   one AIE kernel, vectorized AND scalar. THE
+│   │                         extension point. Also carries ECHO_SRC's
+│   │                         bisect build
+│   ├── base_graph.{h,cpp}    PLIO in / PLIO out -- what goes in the xclbin
+│   ├── echo_graph.{h,cpp}    GMIO in / GMIO out -- simulation only, no PL
 │   └── aiesim_data/echo/     generated stimulus + golden (gitignored)
 ├── host_app_src/
 │   ├── base_host.cpp    the XRT host: BOs, CU launch, verification
@@ -134,7 +172,9 @@ design/
 ├── system_configs/      v++ linker config TEMPLATE (generated, not committed)
 ├── directives/          Vivado post-link Tcl (the AIE clock)
 ├── profiling_configs/   xrt.ini, packaged onto the card
-└── exec_scripts/        the on-target run script TEMPLATE
+└── exec_scripts/
+    ├── run_script.sh    the on-target run script TEMPLATE
+    └── plio_probe.tcl   arms the AXI-Stream handshake capture in xsim
 
 scripts/
 ├── check_env.sh         validates the toolchain before anything expensive runs
@@ -142,8 +182,10 @@ scripts/
 │                        cross-checks itself against the C++ generator
 ├── check_sim_output.py  the simulation verdict; refuses to pass on a missing,
 │                        short or all-poison dump
-└── aie_report.py        reads the AIE compile's own reports: cores, placement,
-                         and the SCHEDULED loop cost (not a measurement)
+├── aie_report.py        reads the AIE compile's own reports: cores, placement,
+│                        and the SCHEDULED loop cost (not a measurement)
+└── analyze_plio_vcd.py  the handshake verdict: did the producer produce, did
+                         the consumer accept, how many beats completed
 docs/                    one file per topic; each carries a status header
 ```
 

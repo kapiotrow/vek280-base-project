@@ -1,7 +1,7 @@
 # Extending the design
 
-**Status:** current 2026-11-11 — phase 1. The AIE recipes below are real; the
-ones marked with a phase are written as that phase lands.
+**Status:** current 2026-11-11 — phase 2. The recipes below are real; the ones
+marked with a phase are written as that phase lands.
 
 ## The three extension points
 
@@ -87,9 +87,52 @@ make x86sim ECHO_N=512 ECHO_TOTAL=4096
 A bigger graph may need a bigger `SIM_WALL_TIMEOUT` for rung 4. The test is
 whether the log still contains the `[echo] wrote ... echo_out.bin` line.
 
+## Recipe: add a PLIO port
+
+Four things have to agree, and **three of the four fail silently**:
+
+1. `design/aie_src/base_graph.h` — `input_plio::create("MyPort", plio_32_bits, "my_in.txt")`
+2. `design/system_configs/base.cfg.in` — `stream_connect=<cu>.<port>:ai_engine_0.MyPort`
+3. The width: `plio_32_bits` must match the PL side's `axis_word_t`.
+4. `--clock.freqHz` for the new CU, in `VPP_LINK_FLAGS`.
+
+A mismatch in (1) vs (2) is an error in neither file — it is a connection that
+does not exist, and therefore a deadlock. A mismatch in (3) links and starves.
+
+Then: `make graph` (does it compile and place?), `make aiesim` (does the graph
+compute?), `make run_emu` (does the link actually move data?). All three, in
+that order — and remember that the second one proves nothing about the third.
+
+## Recipe: debug a PLIO that does not move
+
+```bash
+make debug_sim                               # once per package
+make probe_emu LAUNCH_HW_EMU_EXEC=1          # PL -> AIE direction
+make probe_emu LAUNCH_HW_EMU_EXEC=1 PROBE_CU=data_sink_0 PROBE_PORT=in   # the other way
+```
+
+The verdict and what each outcome means are in
+[`04-dev-cycle.md`](04-dev-cycle.md). If the probe says the producer produced
+and data still never arrived, reach for the bisect build:
+`make aiesim ECHO_SRC=synth`.
+
+## Recipe: run the array with no PL at all
+
+```bash
+make aiesim GRAPH=echo       # GMIO in, GMIO out -- no PL, no linker config
+make x86sim GRAPH=echo       # ...and functionally, in seconds
+```
+
+`GRAPH=echo` wraps **the same kernel** in a GMIO-only graph. It is the right
+place to debug the kernel, because nothing about the PL can be wrong in it.
+`GRAPH=base` is the PLIO graph that goes into the xclbin.
+
+Keeping both is worth the handful of lines: the alternative is debugging kernel
+arithmetic through a linked system, which costs ~100× per iteration and can fail
+for reasons that have nothing to do with your kernel.
+
 ## Recipes that need later phases
 
-- stream from PL into the array (PLIO) — phase 2
 - change the FFT point size — phase 3
 - stream from PL into the array — phase 2
 - raise the PL clock, and find out what it costs — phase 4

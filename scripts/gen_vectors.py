@@ -8,8 +8,10 @@ experiments and nothing will say so.
 
 Writes, into --out-dir (default design/aie_src/aiesim_data/echo/):
 
-    in.bin      ECHO_TOTAL little-endian int32  -- what the harness sends
-    golden.bin  ECHO_TOTAL little-endian int32  -- what the kernel must produce
+    in.bin         ECHO_TOTAL little-endian int32 -- for the GMIO harness
+    golden.bin     ECHO_TOTAL little-endian int32 -- what the kernel must produce
+    stream_in.txt  the same stimulus as decimal text, one value per line --
+                   this is what aiesim feeds a PLIO with INSTEAD OF A PL KERNEL
 
 Geometry and the kernel constants come from the environment so that the Makefile
 is the single source of truth for every default:
@@ -75,6 +77,24 @@ def golden(words, shift, bias):
     return res
 
 
+def write_plio_text(path, words):
+    """Write the stimulus in the text format aiesim feeds a PLIO from.
+
+    For plio_32_bits carrying int32, that is one SIGNED decimal value per line.
+
+    THIS FILE IS THE REASON PHASE 2 EXISTS. When aiesim runs a PLIO graph it
+    reads this file -- there is no PL in an AIE simulation at all. So the
+    producer aiesim gives the graph is perfectly behaved and infinitely patient,
+    which is exactly what a real data_src under a buggy host is not. A graph can
+    pass aiesim against this file and deadlock the instant it is linked.
+    """
+    with open(path, "w") as f:
+        for u in words:
+            f.write("%d\n" % to_signed(u))
+    print("  wrote %-14s %5d lines (PLIO text -- aiesim's fake producer)"
+          % (os.path.basename(path), len(words)))
+
+
 def write_u32(path, words):
     with open(path, "wb") as f:
         f.write(struct.pack("<%dI" % len(words), *words))
@@ -125,6 +145,7 @@ def main():
           % (args.total, args.shift, args.bias, args.out_dir))
     write_u32(os.path.join(args.out_dir, "in.bin"), stim)
     write_u32(os.path.join(args.out_dir, "golden.bin"), golden(stim, args.shift, args.bias))
+    write_plio_text(os.path.join(args.out_dir, "stream_in.txt"), stim)
 
 
 if __name__ == "__main__":

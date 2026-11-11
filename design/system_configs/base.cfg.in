@@ -1,25 +1,40 @@
-# base.cfg.in -- v++ linker configuration TEMPLATE for the phase-0 design.
+# base.cfg.in -- v++ linker configuration TEMPLATE.
 #
 # THIS IS A TEMPLATE, NOT THE CONFIG. The Makefile generates
 # build/<target>/base.cfg from it, substituting @PROJECT_ROOT@.
 #
 # Why: v++ requires an ABSOLUTE path for userPostSysLinkOverlayTcl. Writing one
 # into a committed file is how a project stops building on anyone else's
-# machine -- the reference project has /home/<someone>/... baked into its linker
-# config to this day. Generating the file keeps the repo portable.
+# machine -- the reference project this is derived from has /home/<someone>/...
+# in its linker config to this day.
 #
-# Phase-0 topology:
+# PHASE 2 topology -- the AI Engine is in the datapath:
 #
-#   data_src_0 --AXI4-Stream--> data_sink_0
+#   data_src_0 --AXIS--> ai_engine_0.StreamIn
+#                            echo_kernel
+#   data_sink_0 <--AXIS-- ai_engine_0.StreamOut
 #
-# No AIE graph, no PLIO. Phase 2 redirects the stream into ai_engine_0.
+# Phase 0/1's direct data_src -> data_sink connection is gone.
 
 [connectivity]
 nk=data_src:1:data_src_0
 nk=data_sink:1:data_sink_0
 
-# Kernel-to-kernel AXI4-Stream. The port names are the HLS argument names.
-stream_connect=data_src_0.out:data_sink_0.in
+# PLIO connections.
+#
+# THE NAMES AFTER ai_engine_0. ARE THE PLIO NAMES FROM THE GRAPH, and this is
+# the project's one cross-file string contract:
+#
+#     design/aie_src/base_graph.h:  input_plio::create("StreamIn", ...)
+#     this file:                    ...:ai_engine_0.StreamIn
+#
+# A typo is not an error in either file. It is a connection that silently does
+# not exist, and therefore a deadlock with no diagnostic. If a PLIO design hangs
+# and you have not changed anything else, check these four strings first.
+#
+# The left-hand sides are the HLS argument names of the AXIS ports.
+stream_connect=data_src_0.out:ai_engine_0.StreamIn
+stream_connect=ai_engine_0.StreamOut:data_sink_0.in
 
 # Memory banks.
 #
@@ -36,7 +51,6 @@ sp=data_sink_0.out:LPDDR1
 [advanced]
 param=hw_emu.enableProfiling=false
 
-# Raises the AIE array clock to 1 GHz. Harmless in phase 0 (there is no graph
-# yet) and kept here from the start so the phase-2 diff is about the stream and
-# nothing else.
+# Raises the AIE array clock to 1 GHz. The kernel cycle figures this project
+# quotes are all against 1 GHz.
 param=compiler.userPostSysLinkOverlayTcl=@PROJECT_ROOT@/design/directives/post_sys_link.tcl

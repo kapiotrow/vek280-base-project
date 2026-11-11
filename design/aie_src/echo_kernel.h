@@ -49,6 +49,29 @@
 #  define ECHO_BIAS 1000
 #endif
 
+// ECHO_SRC_SYNTH -- THE BISECT SWITCH. 0 (default) = read the input normally.
+// 1 = SYNTHESIZE the output and never touch the input at all.
+//
+// This exists for one specific situation, and it is the situation phase 2
+// produces: the design hangs, nothing arrives at the other end, and there are
+// two causes that are indistinguishable from outside --
+//
+//     (a) the input never delivers, so the kernel blocks forever, or
+//     (b) the core never runs, so nothing is there to consume the input.
+//
+// Both look like "no output". Building with ECHO_SRC=synth removes the kernel's
+// dependence on its input entirely:
+//
+//     output appears  -> the core runs; the fault is upstream of it  (a)
+//     still nothing   -> the core is not running; the input is a red herring (b)
+//
+// On the reference project this one distinction was the difference between
+// debugging the PLIO and debugging a kernel that was starving on a different
+// port. Build it, look, build it back.
+#ifndef ECHO_SRC_SYNTH
+#  define ECHO_SRC_SYNTH 0
+#endif
+
 // 1 (default) = the vectorized implementation. 0 = the scalar reference.
 //
 // These two must produce BIT-IDENTICAL output, and `make x86sim` runs both and

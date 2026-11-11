@@ -1,12 +1,31 @@
 /*
  * base_host.cpp -- the PS side of the phase-0 design.
  *
- *   host BO --m_axi--> data_src --AXI4-Stream--> data_sink --m_axi--> host BO
+ *   host BO --m_axi--> data_src --AXIS--> PLIO --> echo_kernel (AIE)
+ *                                                        |
+ *   host BO <--m_axi-- data_sink <--AXIS-- PLIO <---------+
  *
- * There is no AIE graph yet. That is deliberate: an image with no AIE graph
- * builds and boots markedly faster, so the first time you fight packaging and
- * XRT you are fighting ONLY packaging and XRT. The array arrives in phase 1,
- * and it arrives in simulation, where it is cheap.
+ * PHASE 2: the AI Engine is now in the datapath. The host's job is unchanged --
+ * fill a buffer, start two CUs, read the result, compare against the golden --
+ * but the golden is no longer the identity, because the array computes
+ * something on the way through.
+ *
+ * THE HOST MUST START THE GRAPH, and this is easy to get wrong because almost
+ * nothing else about the AI Engine appears here. The array is fed and drained
+ * entirely by the two PL kernels over PLIO -- no GMIO, no buffers, no data ever
+ * passes through this process on its way to a core. It is tempting to conclude
+ * that a PLIO design needs no AIE-aware host code at all.
+ *
+ * It does need exactly one thing: somebody has to enable the cores. We package
+ * with --package.defer_aie_run, so loading the xclbin does NOT start them, and
+ * a graph whose cores are not running never drains its input PLIO. data_src
+ * then fills the stream FIFO, stalls, and the whole design hangs with no error.
+ *
+ * That bug was hit while writing this phase, and it is preserved as
+ * MUTANT=nograph because it is the cleanest deadlock in the project: the host
+ * prints "waiting for data_src" and never returns, with no error of any kind.
+ * The probe answers it in one run -- TVALID HIGH, TREADY LOW, the producer
+ * produced and the consumer was never switched on.
  *
  * Every stage prints and flushes before it blocks, so wherever the run stops is
  * exactly what failed. In an emulation that can hang, that property is worth
@@ -23,6 +42,7 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
 #include "xrt/xrt_bo.h"
+#include "xrt/xrt_graph.h"
 
 #include "golden.h"
 
@@ -30,6 +50,73 @@
 // a mutant armed, a PASS is the failure. See docs/04-dev-cycle.md.
 #ifndef MUTANT_ARMED
 #  define MUTANT_ARMED 0
+#endif
+
+/*
+ * TWO INTEGRATION MUTANTS LIVE IN THIS FILE, and they are here rather than in
+ * the kernels because integration is the one category of defect that no cheap
+ * rung can see. Both pass x86sim and aiesim -- which contain no host and no PL,
+ * and feed the PLIO from a text file -- and both break the linked system.
+ *
+ * They fail DIFFERENTLY, and that contrast is the lesson:
+ *
+ *   MUTANT=argidx    aborts, with a message
+ *   MUTANT=nograph   hangs, with nothing
+ *
+ * ---------------------------------------------------------------------------
+ * MUTANT_ARGIDX -- `make ... MUTANT=argidx`
+ *
+ * Uses xrt::run's positional call operator instead of set_arg() by explicit
+ * index. An AXI4-Stream port occupies an argument slot even though it is not a
+ * settable register, so for data_src(in, out_stream, n) the value intended for
+ * `n` lands on the stream port at index 1.
+ *
+ * MEASURED HERE (XRT 2025.2, hw_emu, 2026-11-11): this ABORTS at launch with
+ *
+ *     terminate called after throwing an instance of 'std::runtime_error'
+ *       what():  bad command state, can't launch
+ *
+ * which is the good outcome -- a clear, immediate, attributable failure.
+ *
+ * DO NOT RELY ON GETTING IT. The same class of mistake on the reference project
+ * produced a SILENT ZERO-TRIP LOOP instead: `n` stayed at its reset value, the
+ * kernel asserted ap_done a few cycles after ap_start, TVALID never rose, and
+ * the design simply hung. That cost about a week, during which the fault was
+ * believed to be in the PLIO width, the shim placement, the port allocation and
+ * eventually the viability of PLIO itself -- because "no data arrives" is what
+ * every one of those also looks like.
+ *
+ * Whether you get the abort or the hang depends on which argument slot the
+ * stray value lands on and how malformed the resulting command packet is. The
+ * rule that follows is the same either way: ALWAYS set_arg() by explicit index
+ * on a kernel that has a stream port.
+ */
+#ifndef MUTANT_ARGIDX
+#  define MUTANT_ARGIDX 0
+#endif
+
+/*
+ * MUTANT_NOGRAPH -- `make ... MUTANT=nograph`
+ *
+ * Skips gr.run(). THIS IS THE ONE THAT HANGS, and it produces nothing at all:
+ * no error, no timeout, no output. The host prints "waiting for data_src" and
+ * stops there forever.
+ *
+ * Why: we package with --package.defer_aie_run, so loading the xclbin does not
+ * enable the AI Engine cores. A graph whose cores are not running never drains
+ * its input PLIO, so data_src fills the stream FIFO and stalls.
+ *
+ * This was a real bug while phase 2 was being written -- the host had no graph
+ * handle at all, because with PLIO no data passes through the host and it is
+ * easy to conclude that no AIE-aware host code is needed. It is needed for
+ * exactly one thing: somebody has to switch the cores on.
+ *
+ * It is the right mutant for practising the probe, because the probe answers it
+ * outright: TVALID HIGH, TREADY LOW -- the producer produced and the consumer
+ * never accepted. Compare with argidx, where TVALID never rises at all.
+ */
+#ifndef MUTANT_NOGRAPH
+#  define MUTANT_NOGRAPH 0
 #endif
 
 /*
@@ -77,7 +164,8 @@ int main(int argc, char **argv)
 
     const size_t bytes = n * sizeof(uint32_t);
 
-    printf("[host] phase 0: PL loopback, %zu words (%zu bytes)\n", n, bytes);
+    printf("[host] phase 2: PL -> AIE -> PL, %zu words (%zu bytes)\n", n, bytes);
+    printf("[host] AIE computes (in >> %d) + %d\n", BASE_ECHO_SHIFT, BASE_ECHO_BIAS);
     printf("[host] mutant armed: %d\n", MUTANT_ARMED);
     fflush(stdout);
 
@@ -91,6 +179,30 @@ int main(int argc, char **argv)
     // CU rather than to any CU of that kernel.
     auto k_src  = xrt::kernel(device, uuid, "data_src:{data_src_0}");
     auto k_sink = xrt::kernel(device, uuid, "data_sink:{data_sink_0}");
+
+    // ---- the AI Engine graph -------------------------------------------
+    // "base_graph" is the C++ VARIABLE NAME of the graph object in
+    // design/aie_src/base_graph.cpp, not the class name and not a string
+    // declared anywhere. Rename that variable and this lookup throws.
+    //
+    // run(n) enables the cores for n invocations. The count must match what the
+    // PL will actually send: data_src pushes BASE_N words and the kernel
+    // consumes ECHO_N per firing, so the graph must be good for BASE_N/ECHO_N
+    // firings. Too few and the tail of the stream is never consumed -- which is
+    // a hang, not an error.
+    const int graph_iters = (int)(n / BASE_ECHO_N);
+    xrt::graph gr(device, uuid, "base_graph");
+#if MUTANT_NOGRAPH
+    printf("[host] MUTANT=nograph: NOT starting the AIE graph.\n");
+    printf("[host]   The cores stay disabled, so the input PLIO is never\n");
+    printf("[host]   drained. data_src will fill the stream FIFO and stall.\n");
+    printf("[host]   Expect this run to HANG, silently, with no error.\n");
+    fflush(stdout);
+#else
+    printf("[host] starting AIE graph for %d iterations\n", graph_iters);
+    fflush(stdout);
+    gr.run(graph_iters);
+#endif
 
     // ---- buffers ---------------------------------------------------------
     // Take the memory bank from the kernel argument's own group_id. Do NOT pass
@@ -118,8 +230,19 @@ int main(int argc, char **argv)
 
     // ---- launch ----------------------------------------------------------
     xrt::run r_src(k_src);
+#if MUTANT_ARGIDX
+    // THE BUG, on purpose. Positional assignment starts at index 0, and index 1
+    // is the AXI4-Stream port, so `n` is written there and the real `n` stays 0.
+    printf("[host] MUTANT=argidx: setting data_src args POSITIONALLY.\n");
+    printf("[host]   n will land on the stream port (index 1) and the real n\n");
+    printf("[host]   stays 0. data_src will produce nothing and the AIE kernel\n");
+    printf("[host]   will block forever. Expect this run to HANG.\n");
+    fflush(stdout);
+    r_src(in_bo, (uint32_t)n);
+#else
     r_src.set_arg(arg::SRC_IN, in_bo);
     r_src.set_arg(arg::SRC_N,  (uint32_t)n);
+#endif
 
     xrt::run r_sink(k_sink);
     r_sink.set_arg(arg::SINK_OUT, out_bo);
@@ -142,6 +265,14 @@ int main(int argc, char **argv)
     printf("[host] waiting for data_sink\n"); fflush(stdout);
     r_sink.wait();
     auto t1 = std::chrono::steady_clock::now();
+
+    // The graph ran a finite number of iterations, so waiting for it is well
+    // defined. (On a FREE-RUNNING graph -- run(-1) -- this blocks forever; that
+    // is cosmetic when you are driving it by hand and fatal to a script.)
+#if !MUTANT_NOGRAPH
+    printf("[host] waiting for the AIE graph\n"); fflush(stdout);
+    gr.wait();
+#endif
 
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
@@ -175,5 +306,6 @@ int main(int argc, char **argv)
     else             printf("[host] FAIL -- %zu/%zu words wrong\n", errors, n);
     fflush(stdout);
 
+    gr.end();
     return errors == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
