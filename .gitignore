@@ -20,6 +20,10 @@ AIECompiler.log
 *.xo
 *.vcd
 
+# Generated simulation vectors. `make gen_vectors` writes them from
+# scripts/gen_vectors.py, which is the actual source.
+design/aie_src/aiesim_data/
+
 # The local environment. setup_env.sh carries absolute paths that are specific
 # to one machine; setup_env.sh.example is the committed template.
 setup_env.sh

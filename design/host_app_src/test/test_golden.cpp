@@ -27,10 +27,31 @@ static void check(bool ok, const char *what)
     if (!ok) ++failures;
 }
 
-int main()
+int main(int argc, char **argv)
 {
     const size_t N = 1024;
     std::vector<uint32_t> a(N), b(N), g(N);
+
+    // `test_golden <file>` writes the C++ stimulus out and exits.
+    //
+    // That is what makes the cross-implementation check possible:
+    // scripts/gen_vectors.py implements the SAME contract in Python, because
+    // the simulation harness needs it there, and two implementations of one
+    // contract is precisely the situation that produces a silent mismatch.
+    // `make gen_vectors` dumps this file and has the generator compare itself
+    // against it. On the reference project, a cross-implementation check was
+    // the only thing that ever caught a contract mismatch -- five green unit
+    // tests coexisted with a statistic reading 0.0000 for an entire sweep.
+    if (argc > 1) {
+        base_fill_input(a.data(), N);
+        FILE *f = fopen(argv[1], "wb");
+        if (!f) { fprintf(stderr, "cannot write %s\n", argv[1]); return EXIT_FAILURE; }
+        const size_t put = fwrite(a.data(), sizeof(uint32_t), N, f);
+        fclose(f);
+        if (put != N) { fprintf(stderr, "short write to %s\n", argv[1]); return EXIT_FAILURE; }
+        printf("test_golden: wrote %zu stimulus words to %s\n", N, argv[1]);
+        return EXIT_SUCCESS;
+    }
 
     printf("test_golden: rung 1 (native, no hardware)\n");
 

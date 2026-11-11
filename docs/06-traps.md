@@ -1,7 +1,8 @@
 # Traps
 
-**Status:** current 2026-11-11 — the ones phase 0 can hit, plus those carried
-forward because they shape the design. Symptom first, cause second.
+**Status:** current 2026-11-11 — phase 1. The ones this project can hit today,
+plus those carried forward because they shape the design. Symptom first, cause
+second.
 
 Every entry here cost somebody real time, mostly on the reference project this
 is derived from. None of them produces a sensible error message.
@@ -74,6 +75,60 @@ board: `strings /usr/lib/libxrt_core.so* | grep -i <key>`. And the file must be
 in the **process's working directory**, which is the FAT partition root; a copy
 in a subdirectory is inert.
 
+## The AI Engine toolchain
+
+**Symptom: `make graph` fails with `use of undeclared identifier 'argc'`, on a
+line that is obviously correct, during a step called "Compiling PL Block".**
+For `--target=hw`, aiecompiler compiles the graph `.cpp` a *second* time as a PS
+testbench wrapper, with `-D main\(...\)=ps_main\(...\)` on the command line.
+The replacement text is the **literal** `ps_main(...)`, not
+`ps_main(__VA_ARGS__)` — so `main(int argc, char **argv)` expands to
+`ps_main(...)` and the parameter names are gone. Any body that then mentions
+`argc` or `argv` fails to compile.
+
+x86sim is unaffected, so the graph builds and simulates perfectly right up until
+the first `make graph`. **Declare the harness `int main(void)`** and take
+configuration from the environment. (Hit during this project's own phase 1. The
+reference project avoids it by convention — its graph `main`s never reference
+their parameters — rather than by knowing why.)
+
+**Symptom: `aiesim` never finishes, or always takes exactly as long as the
+timeout.**
+It is not stuck. The harness runs `run(-1)` and never calls `end()`, both
+deliberately: with `run(N)` the ADF runtime begins tearing down after N
+invocations, and during teardown no cycles are driven for the shim DMA, so a
+GMIO `wait()` that has not completed never will. `end()` and the cycle timeout
+then deadlock each other, and the graph destructor hangs talking to a stopped
+event loop — which is why the harness leaves by `_exit()`.
+
+The run is therefore ended from outside, by the wall-clock `timeout`, and takes
+exactly that long whatever you set. The verdict comes from the checker reading
+the dumped file, **not** from aiesimulator's exit status.
+
+**Symptom: an AIE kernel deadlocks on its first GMIO transfer.**
+Three independent causes, each sufficient. Arm the output drain **before**
+sending the input — a full output window stalls the kernel, and a stalled kernel
+stops consuming the input DMA you are waiting on. Issue **one transfer per
+invocation** — `aie2gm_nb()` moves one invocation's worth, not the whole buffer.
+And keep **one outstanding async per port** — XRT permits exactly one.
+
+**Symptom: an AIE buffer works on the first firing and not afterwards.**
+Buffers are double-buffered: the compiler allocates a ping and a pong at
+different addresses, filled by different DMA descriptors (`make graph` prints
+them: `buf0`/`buf0d`). A single-invocation test cannot see this. Drive several.
+
+Relatedly: an AIE `input_buffer` is acquired **per firing**, not per logical
+unit of work. On the reference project, feeding a kernel's weights once per frame
+instead of once per invocation deadlocked it, and the symptom was indistinguishable
+from a broken PLIO.
+
+**Symptom: `import argparse` fails with `AssertionError: SRE module mismatch`.**
+`source settings64.sh` sets `PYTHONHOME`/`PYTHONPATH` to Vivado's bundled
+interpreter, so `python3` runs whatever binary is on `PATH` against *Vivado's*
+standard library. The script works fine in a clean shell, which makes it look
+like a Makefile problem. Every python call in this project goes through
+`$(PYTHON)`, which is `env -u PYTHONHOME -u PYTHONPATH python3`.
+
 ## Simulation
 
 **Symptom: `make test_pl` hangs with no output at all.**
@@ -106,6 +161,12 @@ Flag stamps. A make variable touches no source file. See
 
 **Symptom: a stale report tells you about a build that failed.**
 Reports survive a failed compile. Check the timestamp, not just the contents.
+
+**Symptom: a Makefile variable expands to nothing, with no warning.**
+`:=` expands immediately, so a variable used before it is defined becomes the
+empty string silently. In phase 1 this produced `--simulation-cycle-timeout=`
+and a simulator that refused to start. If a knob appears to have no effect,
+print it: `make print-<KNOB>`.
 
 **Symptom: a feature flag appears to be absent from a build.**
 Verify a flag on a build that can actually exercise it. `strings` can report a
